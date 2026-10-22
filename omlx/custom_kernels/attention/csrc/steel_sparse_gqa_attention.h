@@ -81,7 +81,7 @@ qwen4_qsa_sparse_gqa_attention(
   constexpr short padV = 16 / sizeof(T);
 
   constexpr short LDQ = DC + padQ;
-  constexpr short LDK = BK + padK;
+  constexpr short LDK = DC + padK;
   constexpr short LDV = DC + padV;
 
   constexpr int kNWarps = WM;
@@ -105,7 +105,7 @@ qwen4_qsa_sparse_gqa_attention(
   const int b = int(tid.z);
 
   threadgroup T Qs[H_PAD * LDQ];
-  threadgroup T KVs[(BK * LDV > DC * LDK) ? BK * LDV : DC * LDK];
+  threadgroup T KVs[BK * (LDV > LDK ? LDV : LDK)];
   threadgroup int selected[BK];
 
   using MMAFragAcc = BaseMMAFrag<AccumType, kFragSize, kFragSize>;
@@ -121,7 +121,7 @@ qwen4_qsa_sparse_gqa_attention(
   const short sn = simd_coord.x;
   const short tm = kFragSize * TQ * simd_group_id;
   const short Qs_offset = (tm + sm) * LDQ + sn;
-  const short Ks_offset = sm * LDK + sn;
+  const short Ks_offset = sm + sn * LDK;
   const short Vs_offset = sm * LDV + sn;
 
   const AccumType scale = AccumType(params->scale * M_LOG2E_F);
@@ -205,20 +205,14 @@ qwen4_qsa_sparse_gqa_attention(
                                           dbase) +
                    d8);
         }
-        thread T *values = (thread T *)&word;
-        const int d = d8 * 8;
-        STEEL_PRAGMA_UNROLL
-        for (short e = 0; e < 8; ++e) {
-          KVs[k + (d + e) * LDK] = values[e];
-        }
+        *((threadgroup uint4 *)(KVs + k * LDK) + d8) = word;
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       STEEL_PRAGMA_UNROLL
       for (short dd = 0; dd < TDC; ++dd) {
         simdgroup_barrier(mem_flags::mem_none);
         Qtile.template load<T, 1, 1, LDQ, 1>(&Qs[Qs_offset + dd * kFragSize]);
-        Ktile.template load<T, 1, 1, LDK, 1>(
-            &KVs[Ks_offset + dd * kFragSize * LDK]);
+        Ktile.template load<T, 1, 1, 1, LDK>(&KVs[Ks_offset + dd * kFragSize]);
         simdgroup_barrier(mem_flags::mem_none);
         tile_matmad(Stile, Qtile, Ktile, Stile);
       }
