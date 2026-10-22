@@ -17,6 +17,7 @@ from typing import Any
 
 import mlx.core as mx
 
+from .gather_qmm_tiles import tiled_gather_qmm
 from .m5_gather_qmm import fused_gate_up_activation
 from .m5_gather_qmm_a8 import try_routed_a8
 from .moe_routes import sort_routes
@@ -72,6 +73,12 @@ def _should_route(self: Any, x: mx.array, target_verify: bool, min_tokens: int) 
     )
 
 
+def _sorted_gather(linear: Any, x: mx.array, idx: mx.array, training: bool) -> mx.array:
+    # The tiled kernel is bit-identical to MLX's; None keeps MLX's.
+    routed = None if training else tiled_gather_qmm(linear, x, idx)
+    return routed if routed is not None else linear(x, idx, sorted_indices=True)
+
+
 def _native_switch_weighted_sum(
     switch_mlp: Any,
     x: mx.array,
@@ -113,18 +120,16 @@ def _native_switch_weighted_sum(
                 token_rows=(x_tok, row_map),
             )
         if x_act is None:
-            x_gate_up = gate_up(x_sorted, idx, sorted_indices=True)
+            x_gate_up = _sorted_gather(gate_up, x_sorted, idx, switch_mlp.training)
             x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
     else:
-        x_up = switch_mlp.up_proj(x_sorted, idx, sorted_indices=True)
-        x_gate = switch_mlp.gate_proj(x_sorted, idx, sorted_indices=True)
+        x_up = _sorted_gather(switch_mlp.up_proj, x_sorted, idx, switch_mlp.training)
+        x_gate = _sorted_gather(
+            switch_mlp.gate_proj, x_sorted, idx, switch_mlp.training
+        )
     if x_act is None:
         x_act = switch_mlp.activation(x_up, x_gate)
-    x_sorted = switch_mlp.down_proj(
-        x_act,
-        idx,
-        sorted_indices=True,
-    )
+    x_sorted = _sorted_gather(switch_mlp.down_proj, x_act, idx, switch_mlp.training)
     return weighted_sum(
         mx.contiguous(x_sorted),
         mx.contiguous(inv_order.astype(mx.uint32)),
